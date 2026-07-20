@@ -11,6 +11,10 @@ var CHUNK_BASE_PATH = "";
 var RELATIVE_ROOT_PATH = "../../../../../../..";
 var RUNTIME_PUBLIC_PATH = "";
 const SUPPORT_COMPONENT_CHUNKS = false;
+globalThis["TURBOPACK_CHUNK_UPDATE_LISTENERS"] ||= [];
+var CHUNK_UPDATE_LISTENERS = {
+    push: (registration) => globalThis["TURBOPACK_CHUNK_UPDATE_LISTENERS"].push(registration),
+};
 var ASSET_SUFFIX = "";
 var CROSS_ORIGIN = null;
 var CHUNK_LOAD_RETRY_MAX_ATTEMPTS = 1;
@@ -2115,7 +2119,7 @@ function registerChunk(registration) {
     const chunkListPath = getPathFromScript(chunkListScript);
     // The "chunk" is also registered to finish the loading in the backend
     BACKEND.registerChunk(chunkListPath);
-    globalThis.TURBOPACK_CHUNK_UPDATE_LISTENERS.push([
+    CHUNK_UPDATE_LISTENERS.push([
         chunkListPath,
         handleApply.bind(null, chunkListPath)
     ]);
@@ -2137,7 +2141,6 @@ function registerChunk(registration) {
         markChunkListAsRuntime(chunkListPath);
     }
 }
-globalThis.TURBOPACK_CHUNK_UPDATE_LISTENERS ??= [];
 /**
  * This file contains the runtime code specific to the Turbopack ECMAScript DOM runtime.
  *
