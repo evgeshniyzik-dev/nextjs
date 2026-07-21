@@ -41,10 +41,12 @@ import {
 } from '../../../shared/lib/router/utils/prepare-destination'
 import type { TLSSocket } from 'tls'
 import {
+  NEXT_ROUTER_PREFETCH_HEADER,
   NEXT_REWRITTEN_PATH_HEADER,
   NEXT_REWRITTEN_QUERY_HEADER,
   RSC_HEADER,
 } from '../../../client/components/app-router-headers'
+import { getServerActionRequestMetadata } from '../server-action-request-meta'
 
 const debug = setupDebug('next:router-server:resolve-routes')
 
@@ -139,6 +141,13 @@ export function getResolveRoutes(
     let matchedOutput: FsOutput | null = null
     let parsedUrl = parseUrl(req.url || '') as NextUrlWithParsedQuery
     let didRewrite = false
+    // Only actual navigations and fetch actions compile the SSR-free output,
+    // never prefetches. This mirrors the request metadata used by the server,
+    // but is derived here because fsChecker ensures the route before render.
+    const rscOnly =
+      (isRSCRequestHeader(req.headers[RSC_HEADER]) &&
+        req.headers[NEXT_ROUTER_PREFETCH_HEADER] !== '1') ||
+      getServerActionRequestMetadata(req).isFetchAction
 
     const urlParts = (req.url || '').split('?', 1)
     const urlNoQuery = urlParts[0]
@@ -286,7 +295,7 @@ export function getResolveRoutes(
         return
       }
       if (!invokedOutputs?.has(pathname)) {
-        const output = await fsChecker.getItem(pathname)
+        const output = await fsChecker.getItem(pathname, undefined, rscOnly)
 
         if (output) {
           if (
@@ -322,7 +331,9 @@ export function getResolveRoutes(
 
         if (params) {
           const pageOutput = await fsChecker.getItem(
-            addPathPrefix(route.page, config.basePath || '')
+            addPathPrefix(route.page, config.basePath || ''),
+            curPathname || undefined,
+            rscOnly
           )
 
           // i18n locales aren't matched for app dir
@@ -339,6 +350,13 @@ export function getResolveRoutes(
 
           if (config.useFileSystemPublicRoutes || didRewrite) {
             return pageOutput
+              ? {
+                  ...pageOutput,
+                  // The dynamic-route scan matched the concrete request path;
+                  // keep those params with the fsChecker route definition.
+                  params,
+                }
+              : null
           }
         }
       }
@@ -494,7 +512,7 @@ export function getResolveRoutes(
           if (invokedOutputs?.has(pathname) || checkLocaleApi(pathname)) {
             return
           }
-          const output = await fsChecker.getItem(pathname)
+          const output = await fsChecker.getItem(pathname, undefined, rscOnly)
 
           if (
             output &&
