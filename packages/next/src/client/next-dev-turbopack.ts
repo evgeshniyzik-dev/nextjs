@@ -4,9 +4,8 @@ import { initialize, version, router, emitter } from './'
 import initHMR from './dev/hot-middleware-client'
 
 import { pageBootstrap } from './page-bootstrap'
-// prettier-ignore
 //@ts-expect-error requires "moduleResolution": "node16" in tsconfig.json and not .ts extension
-import { connect, TURBOPACK_CHUNK_UPDATE_LISTENERS_GLOBAL } from '@vercel/turbopack-ecmascript-runtime/browser/dev/hmr-client/hmr-client.ts'
+import { connect } from '@vercel/turbopack-ecmascript-runtime/browser/dev/hmr-client/hmr-client.ts'
 import type { TurbopackMessageSentToBrowser } from '../server/dev/hot-reloader-types'
 
 window.next = {
@@ -49,7 +48,8 @@ initialize({
       },
       sendMessage: devClient.sendTurbopackMessage,
       onUpdateError: devClient.handleUpdateError,
-      chunkUpdateListenersGlobal: TURBOPACK_CHUNK_UPDATE_LISTENERS_GLOBAL,
+      chunkUpdateListenersGlobal:
+        process.env.__NEXT_TURBOPACK_CHUNK_UPDATE_LISTENERS_GLOBAL!,
     })
 
     return pageBootstrap(assetPrefix)
