@@ -1226,6 +1226,7 @@ function setResponseHeaders(
   xCache: XCacheHeader,
   imagesConfig: ImageConfigComplete,
   maxAge: number,
+  generateEtags: boolean,
   isDev: boolean
 ) {
   res.setHeader('Vary', 'Accept')
@@ -1235,7 +1236,7 @@ function setResponseHeaders(
       ? 'public, max-age=315360000, immutable'
       : `public, max-age=${isDev ? 0 : maxAge}, must-revalidate`
   )
-  if (sendEtagResponse(req, res, etag)) {
+  if (generateEtags && sendEtagResponse(req, res, etag)) {
     // already called res.end() so we're finished
     return { finished: true }
   }
@@ -1266,6 +1267,7 @@ export function sendResponse(
   xCache: XCacheHeader,
   imagesConfig: ImageConfigComplete,
   maxAge: number,
+  generateEtags: boolean,
   isDev: boolean
 ) {
   const contentType = getContentType(extension)
@@ -1279,6 +1281,7 @@ export function sendResponse(
     xCache,
     imagesConfig,
     maxAge,
+    generateEtags,
     isDev
   )
   if (!result.finished) {
