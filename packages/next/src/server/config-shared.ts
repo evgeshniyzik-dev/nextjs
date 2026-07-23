@@ -503,6 +503,7 @@ export interface ExperimentalConfig {
    */
   cachedNavigations?: boolean | 'allow-runtime'
   dynamicOnHover?: boolean
+  turbopackPrefetchInDev?: boolean
   useOffline?: boolean
   optimisticRouting?: boolean
   instrumentationClientRouterTransitionEvents?: boolean
@@ -2131,6 +2132,7 @@ export const defaultConfig = Object.freeze({
     clientParamParsingOrigins: undefined,
     cachedNavigations: false,
     dynamicOnHover: false,
+    turbopackPrefetchInDev: false,
     useOffline: false,
     varyParams: true,
     optimisticRouting: true,
