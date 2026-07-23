@@ -31,8 +31,10 @@ import * as Log from '../../build/output/log'
 import { BLOCKED_PAGES } from '../../shared/lib/constants'
 import {
   getOverlayMiddleware,
+  getSourceContentMiddleware,
   getSourceMapMiddleware,
   getOriginalStackFrames,
+  SOURCE_CONTENT_MIDDLEWARE_PREFIX,
 } from './middleware-turbopack'
 import { PageNotFoundError } from '../../shared/lib/utils'
 import { debounce } from '../utils'
@@ -279,6 +281,50 @@ function getSourceMapFromTurbopack(
   }
 }
 
+/**
+ * Renders a code frame for a server stack frame whose source map omitted inlined `sourcesContent`
+ * (dev with `experimental.turbopackServeSourceContent`). The map-resolved `source` is a project
+ * path relative to the on-demand content endpoint's `sourceRoot`; strip that prefix and read +
+ * render the frame in a single synchronous native call so the source never crosses into JS.
+ * Returns null when `source` isn't a servable project file.
+ */
+function getCodeFrameFromTurbopack(
+  project: Project,
+  frame: { line1: number | null; column1: number | null },
+  source: string,
+  colors: boolean
+): string | null {
+  // The resolved source carries the on-demand content `sourceRoot`. Depending on the source-map
+  // consumer, it may be prefixed with the `file://` scheme (the sync consumer used by
+  // `patch-error-inspect` resolves the sourceRoot-relative source as a URL) or bare (the async
+  // overlay consumer). Normalize both to the project-relative path.
+  const withoutScheme = source.startsWith('file://')
+    ? source.slice('file://'.length)
+    : source
+  if (
+    !withoutScheme.startsWith(SOURCE_CONTENT_MIDDLEWARE_PREFIX) ||
+    frame.line1 == null
+  ) {
+    return null
+  }
+  const filePath = withoutScheme.slice(SOURCE_CONTENT_MIDDLEWARE_PREFIX.length)
+  try {
+    return project.getCodeFrameForAssetSync(
+      filePath,
+      {
+        start: {
+          line: frame.line1,
+          column: frame.column1 ?? undefined,
+        },
+      },
+      { color: colors }
+    )
+  } catch {
+    // Reading source is race-condition prone (the file may have changed/been deleted).
+    return null
+  }
+}
+
 export async function createHotReloaderTurbopack(
   opts: SetupOpts & { isSrcDir: boolean },
   serverFields: ServerFields,
@@ -414,6 +460,13 @@ export async function createHotReloaderTurbopack(
   const { installCodeFrameSupport } =
     require('../lib/install-code-frame') as typeof import('../lib/install-code-frame')
   installCodeFrameSupport()
+  // For dev maps that omit inlined content (`experimental.turbopackServeSourceContent`), render
+  // server-side code frames by reading the original source from turbopack instead of from disk.
+  const { setNativeCodeFrameRenderer } =
+    require('../patch-error-inspect') as typeof import('../patch-error-inspect')
+  setNativeCodeFrameRenderer((frame, source, colors) =>
+    getCodeFrameFromTurbopack(project, frame, source, colors)
+  )
 
   opts.onDevServerCleanup?.(async () => {
     setBundlerFindSourceMapImplementation(() => undefined)
@@ -997,6 +1050,7 @@ export async function createHotReloaderTurbopack(
       isSrcDir: opts.isSrcDir,
     }),
     getSourceMapMiddleware(project),
+    getSourceContentMiddleware(project),
     getNextErrorFeedbackMiddleware(opts.telemetry),
     getDevOverlayFontMiddleware(),
     getDisableDevIndicatorMiddleware(),

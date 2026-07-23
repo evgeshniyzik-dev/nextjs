@@ -43,6 +43,28 @@ export function setCodeFrameRenderer(renderer: CodeFrameRenderer): void {
   codeFrameRenderer = renderer
 }
 
+/**
+ * Renders a code frame by reading the original source from turbopack, for maps that omit inlined
+ * `sourcesContent` (dev with `experimental.turbopackServeSourceContent`). Injected by the dev
+ * server so this module keeps no hard dependency on native bindings. Given the map-resolved source
+ * URL (which may be prefixed by the on-demand-content `sourceRoot`), the renderer maps it back to a
+ * project file, reads + renders the frame in a single synchronous native call, and returns null if
+ * the source is not a servable project file.
+ */
+type NativeCodeFrameRenderer = (
+  frame: IgnorableStackFrame,
+  source: string,
+  colors: boolean
+) => string | null
+
+let nativeCodeFrameRenderer: NativeCodeFrameRenderer | undefined
+
+export function setNativeCodeFrameRenderer(
+  renderer: NativeCodeFrameRenderer
+): void {
+  nativeCodeFrameRenderer = renderer
+}
+
 function getOriginalCodeFrame(
   frame: IgnorableStackFrame,
   source: string | null,
@@ -336,11 +358,22 @@ function getSourcemappedFrameIfPossible(
             sourcePosition.source,
             /* returnNullOnMissing */ true
           ) ?? null
-        codeFrame = getOriginalCodeFrame(
-          originalFrame,
-          sourceContent,
-          inspectOptions.colors
-        )
+        if (sourceContent === null && nativeCodeFrameRenderer) {
+          // The map omitted inlined content for this source (dev with
+          // `experimental.turbopackServeSourceContent`). Read + render the frame from turbopack in
+          // one synchronous native call instead of laundering the source through JS.
+          codeFrame = nativeCodeFrameRenderer(
+            originalFrame,
+            sourcePosition.source,
+            inspectOptions.colors ?? false
+          )
+        } else {
+          codeFrame = getOriginalCodeFrame(
+            originalFrame,
+            sourceContent,
+            inspectOptions.colors
+          )
+        }
       }
       return codeFrame
     },
