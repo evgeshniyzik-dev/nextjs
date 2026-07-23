@@ -158,6 +158,36 @@ export function filterStackFrameDEV(
   }
 }
 
+// `scriptNameOrSourceURL` is what React forwards from the stack frame: the
+// script's `getScriptNameOrSourceURL()`, which for the server chunks we can
+// map is an absolute filesystem path, not a URL. The returned value is the
+// source map's URL (`file:` or `data:`).
+type FindSourceMapURL = (scriptNameOrSourceURL: string) => string | null
+// Find the URL of a source map using the bundler's API.
+// Shared via `globalThis` because this module is compiled both into the server
+// runtime bundles (which call `findSourceMapURLDEV`) and into `next/dist/server`
+// (where the dev server registers the implementation), and each copy has its own
+// module state.
+const bundlerFindSourceMapURLSymbol = Symbol.for(
+  'next.server.bundlerFindSourceMapURL'
+)
+
+export function setBundlerFindSourceMapURLImplementation(
+  findSourceMapURLImplementation: FindSourceMapURL
+): void {
+  ;(globalThis as any)[bundlerFindSourceMapURLSymbol] =
+    findSourceMapURLImplementation
+}
+
+function bundlerFindSourceMapURL(scriptNameOrSourceURL: string): string | null {
+  const implementation: FindSourceMapURL | undefined = (globalThis as any)[
+    bundlerFindSourceMapURLSymbol
+  ]
+  return implementation === undefined
+    ? null
+    : implementation(scriptNameOrSourceURL)
+}
+
 const invalidSourceMap = Symbol('invalid-source-map')
 const sourceMapURLs = new LRUCache<string | typeof invalidSourceMap>(
   512 * 1024 * 1024,
@@ -174,25 +204,37 @@ export function findSourceMapURLDEV(
 ): string | null {
   let sourceMapURL = sourceMapURLs.get(scriptNameOrSourceURL)
   if (sourceMapURL === undefined) {
-    let sourceMapPayload: ModernSourceMapPayload | undefined
     try {
-      sourceMapPayload = findSourceMap(scriptNameOrSourceURL)?.payload
+      sourceMapURL = bundlerFindSourceMapURL(scriptNameOrSourceURL) ?? undefined
     } catch (cause) {
       console.error(
-        `${scriptNameOrSourceURL}: Invalid source map. Only conformant source maps can be used to find the original code. Cause: ${cause}`
+        `${scriptNameOrSourceURL}: Failed to find the source map URL. Cause: ${cause}`
       )
     }
 
-    if (sourceMapPayload === undefined) {
-      sourceMapURL = invalidSourceMap
-    } else {
-      // TODO: Might be more efficient to extract the relevant section from Index Maps.
-      // Unclear if that search is worth the smaller payload we have to stringify.
-      const sourceMapJSON = JSON.stringify(sourceMapPayload)
-      const sourceMapURLData = Buffer.from(sourceMapJSON, 'utf8').toString(
-        'base64'
-      )
-      sourceMapURL = `data:application/json;base64,${sourceMapURLData}`
+    if (sourceMapURL === undefined) {
+      // No bundler implementation (e.g. Webpack): inline the source map
+      // Node.js knows as a `data:` URL.
+      let sourceMapPayload: ModernSourceMapPayload | undefined
+      try {
+        sourceMapPayload = findSourceMap(scriptNameOrSourceURL)?.payload
+      } catch (cause) {
+        console.error(
+          `${scriptNameOrSourceURL}: Invalid source map. Only conformant source maps can be used to find the original code. Cause: ${cause}`
+        )
+      }
+
+      if (sourceMapPayload === undefined) {
+        sourceMapURL = invalidSourceMap
+      } else {
+        // TODO: Might be more efficient to extract the relevant section from Index Maps.
+        // Unclear if that search is worth the smaller payload we have to stringify.
+        const sourceMapJSON = JSON.stringify(sourceMapPayload)
+        const sourceMapURLData = Buffer.from(sourceMapJSON, 'utf8').toString(
+          'base64'
+        )
+        sourceMapURL = `data:application/json;base64,${sourceMapURLData}`
+      }
     }
 
     sourceMapURLs.set(scriptNameOrSourceURL, sourceMapURL)
