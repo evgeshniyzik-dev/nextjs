@@ -264,6 +264,7 @@ export async function handler(
     interceptionRoutePatterns,
     deploymentId,
     clientAssetToken,
+    previewProps,
   } = prepareResult
 
   let { isOnDemandRevalidate } = prepareResult
@@ -787,6 +788,7 @@ export async function handler(
       (await routeModule.getIncrementalCache(
         req,
         nextConfig,
+        previewProps,
         prerenderManifest,
         isMinimalMode
       ))
@@ -880,7 +882,7 @@ export async function handler(
           crossOrigin: nextConfig.crossOrigin,
           trailingSlash: nextConfig.trailingSlash,
           images: nextConfig.images,
-          previewProps: prerenderManifest.preview,
+          previewProps,
           enableTainting: nextConfig.experimental.taint,
           htmlLimitedBots: nextConfig.htmlLimitedBots,
           reactMaxHeadersLength: nextConfig.reactMaxHeadersLength,
@@ -1226,6 +1228,7 @@ export async function handler(
               nextConfig,
               routeKind: RouteKind.APP_PAGE,
               isFallback: true,
+              previewProps,
               prerenderManifest,
               isRoutePPREnabled,
               responseGenerator: async () =>
@@ -1580,6 +1583,7 @@ export async function handler(
         isRoutePPREnabled,
         req,
         nextConfig,
+        previewProps,
         prerenderManifest,
         waitUntil: ctx.waitUntil,
         isMinimalMode,
