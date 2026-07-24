@@ -691,6 +691,27 @@ export async function createHotReloaderTurbopack(
     client.send(data)
   }
 
+  // Whether Turbopack is between an update's `start` and `end` (see
+  // `handleProjectUpdates`).
+  let updateInProgress = false
+  let serverComponentsChanged = false
+
+  function sendServerComponentChanges() {
+    sendHmr('server-component-changes', {
+      type: HMR_MESSAGE_SENT_TO_BROWSER.SERVER_COMPONENT_CHANGES,
+    })
+  }
+
+  // Server component changes are announced once per update, not once per
+  // affected route endpoint: every copy would make a client refetch its page.
+  function noteServerComponentsChanged() {
+    if (updateInProgress) {
+      serverComponentsChanged = true
+    } else {
+      sendServerComponentChanges()
+    }
+  }
+
   function sendEnqueuedMessages() {
     for (const [, issueMap] of currentEntryIssues) {
       if (
@@ -1800,6 +1821,7 @@ export async function createHotReloaderTurbopack(
                 subscribeToChanges: subscribeToChanges
                   ? subscribeToClientChanges
                   : ((async () => {}) as StartChangeSubscription),
+                onServerComponentsChanged: noteServerComponentsChanged,
                 handleWrittenEndpoint: (id, result, forceDeleteCache) => {
                   currentWrittenEntrypoints.set(id, result)
                   assetMapper.setPathsForKey(id, result.clientPaths)
@@ -1851,6 +1873,7 @@ export async function createHotReloaderTurbopack(
     for await (const updateMessage of project.updateInfoSubscribe(30)) {
       switch (updateMessage.updateType) {
         case 'start': {
+          updateInProgress = true
           hotReloader.send({ type: HMR_MESSAGE_SENT_TO_BROWSER.BUILDING })
           // Mark that HMR has started and we need to call the callback after it settles
           // This ensures onBeforeDeferredEntries will be called again during HMR
@@ -1862,6 +1885,11 @@ export async function createHotReloaderTurbopack(
           break
         }
         case 'end': {
+          updateInProgress = false
+          if (serverComponentsChanged) {
+            serverComponentsChanged = false
+            sendServerComponentChanges()
+          }
           sendEnqueuedMessages()
 
           function addToErrorsMap(
