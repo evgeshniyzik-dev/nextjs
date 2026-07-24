@@ -77,26 +77,119 @@ describe('request insights trace viewer', () => {
     ).toBe(false)
   })
 
-  it('shows the Instant Insights root span in the default trace', () => {
+  it('shows the Instant Insights pipeline in the default trace', () => {
     const request = createRequest({
       kind: 'instant-insights',
       spans: [
         {
           name: 'Instant Insights',
+          spanId: 'root',
           startTime: 100,
-          durationMs: 50,
+          durationMs: 60,
           attributes: {
             'next.span_type': 'AppRender.instantInsights',
+          },
+        },
+        {
+          name: 'Wait for cache readiness',
+          spanId: 'cache',
+          parentSpanId: 'root',
+          startTime: 102,
+          durationMs: 3,
+          attributes: {
+            'next.span_type': 'AppRender.instantInsights.waitForCache',
+          },
+        },
+        {
+          name: 'Prepare validation inputs',
+          spanId: 'prepare',
+          parentSpanId: 'root',
+          startTime: 105,
+          durationMs: 20,
+          attributes: {
+            'next.span_type': 'AppRender.instantInsights.prepareValidation',
+          },
+        },
+        {
+          name: 'Run validation',
+          spanId: 'validate',
+          parentSpanId: 'root',
+          startTime: 125,
+          durationMs: 30,
+          attributes: {
+            'next.span_type': 'AppRender.instantInsights.runValidation',
+          },
+        },
+        {
+          name: 'Render /dashboard',
+          spanId: 'render-dashboard',
+          parentSpanId: 'validate',
+          startTime: 138,
+          durationMs: 8,
+          attributes: {
+            'next.segment': '/dashboard',
+            'next.span_type': 'AppRender.instantInsights.renderAttempt',
+          },
+        },
+        {
+          name: 'Render /dashboard (runtime retry)',
+          spanId: 'render-dashboard-retry',
+          parentSpanId: 'validate',
+          startTime: 147,
+          durationMs: 6,
+          attributes: {
+            'next.segment': '/dashboard',
+            'next.span_type': 'AppRender.instantInsights.renderAttempt',
+          },
+        },
+        {
+          name: 'Warm up validation',
+          spanId: 'warmup-validation',
+          parentSpanId: 'validate',
+          startTime: 126,
+          durationMs: 3,
+          attributes: {
+            'next.span_type': 'AppRender.instantInsights.warmupValidation',
+          },
+        },
+        {
+          name: 'Validate static shell',
+          spanId: 'validate-static-shell',
+          parentSpanId: 'validate',
+          startTime: 130,
+          durationMs: 3,
+          attributes: {
+            'next.span_type': 'AppRender.instantInsights.validateStaticShell',
+          },
+        },
+        {
+          name: 'Prepare render attempts',
+          spanId: 'prepare-render-attempts',
+          parentSpanId: 'validate',
+          startTime: 134,
+          durationMs: 3,
+          attributes: {
+            'next.span_type': 'AppRender.instantInsights.prepareRenderAttempts',
           },
         },
       ],
     })
 
-    expect(getTraceItems(request, false)).toEqual([
-      expect.objectContaining({
-        label: 'Instant Insights',
-        spanType: 'AppRender.instantInsights',
-      }),
+    expect(
+      getTraceItems(request, false).map(({ label, depth }) => ({
+        label,
+        depth,
+      }))
+    ).toEqual([
+      { label: 'Instant Insights', depth: 0 },
+      { label: 'Wait for cache readiness', depth: 1 },
+      { label: 'Prepare validation inputs', depth: 1 },
+      { label: 'Run validation', depth: 1 },
+      { label: 'Warm up validation', depth: 2 },
+      { label: 'Validate static shell', depth: 2 },
+      { label: 'Prepare render attempts', depth: 2 },
+      { label: 'Render /dashboard', depth: 2 },
+      { label: 'Render /dashboard (runtime retry)', depth: 2 },
     ])
   })
 

@@ -12,6 +12,8 @@ type RequestInsight = {
   status: 'ok'
   spans: Array<{
     name?: string
+    spanId?: string
+    parentSpanId?: string
     attributes?: Record<string, string | number | boolean>
   }>
   fetches: Array<{
@@ -150,19 +152,135 @@ describe('request insights', () => {
         })
       )
       expect(instantInsights?.htmlRequestId).toBe(request?.htmlRequestId)
-      expect(
-        instantInsights?.spans.some(
-          (span) =>
-            span.attributes?.['next.span_type'] ===
-              'AppRender.instantInsights' && span.name === 'Instant Insights'
+      const rootSpans = instantInsights?.spans.filter(
+        (span) =>
+          span.attributes?.['next.span_type'] === 'AppRender.instantInsights' &&
+          span.name === 'Instant Insights'
+      )
+      expect(rootSpans?.length).toBeGreaterThan(0)
+
+      const pipelineSpanTypes = [
+        'AppRender.instantInsights.waitForCache',
+        'AppRender.instantInsights.prepareValidation',
+        'AppRender.instantInsights.runValidation',
+      ]
+      const pipelineSpans = instantInsights?.spans.filter((span) =>
+        pipelineSpanTypes.includes(
+          span.attributes?.['next.span_type'] as string
         )
-      ).toBe(true)
+      )
+      expect(
+        pipelineSpans?.map((span) => span.attributes?.['next.span_type'])
+      ).toEqual(
+        expect.arrayContaining([
+          'AppRender.instantInsights.prepareValidation',
+          'AppRender.instantInsights.runValidation',
+        ])
+      )
+      for (const span of pipelineSpans ?? []) {
+        expect(
+          rootSpans?.some((rootSpan) => rootSpan.spanId === span.parentSpanId)
+        ).toBe(true)
+      }
+
+      const runValidationSpans = pipelineSpans?.filter(
+        (span) =>
+          span.attributes?.['next.span_type'] ===
+          'AppRender.instantInsights.runValidation'
+      )
+      const validationPhaseSpanTypes = [
+        'AppRender.instantInsights.warmupValidation',
+        'AppRender.instantInsights.validateStaticShell',
+        'AppRender.instantInsights.prepareRenderAttempts',
+      ]
+      const validationPhaseSpans = instantInsights?.spans.filter((span) =>
+        validationPhaseSpanTypes.includes(
+          span.attributes?.['next.span_type'] as string
+        )
+      )
+      expect(
+        validationPhaseSpans?.map((span) => span.attributes?.['next.span_type'])
+      ).toEqual(expect.arrayContaining(validationPhaseSpanTypes))
+      for (const span of validationPhaseSpans ?? []) {
+        expect(
+          runValidationSpans?.some(
+            (runValidationSpan) =>
+              runValidationSpan.spanId === span.parentSpanId
+          )
+        ).toBe(true)
+      }
+      const renderAttemptSpans = instantInsights?.spans.filter(
+        (span) =>
+          span.attributes?.['next.span_type'] ===
+          'AppRender.instantInsights.renderAttempt'
+      )
+      expect(renderAttemptSpans?.length).toBeGreaterThan(1)
+      for (const span of renderAttemptSpans ?? []) {
+        expect(span.name).toMatch(/^Render \//)
+        expect(span.attributes?.['next.segment']).not.toBe('')
+        expect(
+          runValidationSpans?.some(
+            (runValidationSpan) =>
+              runValidationSpan.spanId === span.parentSpanId
+          )
+        ).toBe(true)
+      }
       expect(
         request?.spans.some(
           (span) =>
-            span.attributes?.['next.span_type'] === 'AppRender.instantInsights'
+            span.attributes?.['next.span_type'] ===
+              'AppRender.instantInsights' ||
+            pipelineSpanTypes.includes(
+              span.attributes?.['next.span_type'] as string
+            ) ||
+            validationPhaseSpanTypes.includes(
+              span.attributes?.['next.span_type'] as string
+            ) ||
+            span.attributes?.['next.span_type'] ===
+              'AppRender.instantInsights.renderAttempt'
         )
       ).toBe(false)
+    })
+  })
+
+  it('does not include request values in render attempt spans', async () => {
+    const paramValue = 'private-param-value'
+    const searchValue = 'private-search-value'
+    await next.render(`/instant-insights/${paramValue}?token=${searchValue}`)
+
+    await retry(async () => {
+      const snapshot = (await next
+        .fetch('/_next/development/request-insights')
+        .then((response) => response.json())) as {
+        requests: RequestInsight[]
+      }
+      const instantInsight = snapshot.requests.find(
+        (request) =>
+          request.kind === 'instant-insights' &&
+          request.route === '/instant-insights/[slug]'
+      )
+      const renderAttemptSpans = instantInsight?.spans.filter(
+        (span) =>
+          span.attributes?.['next.span_type'] ===
+          'AppRender.instantInsights.renderAttempt'
+      )
+
+      expect(renderAttemptSpans?.length).toBeGreaterThan(0)
+      for (const span of renderAttemptSpans ?? []) {
+        expect(span.name).not.toContain(paramValue)
+        expect(span.name).not.toContain(searchValue)
+        expect(span.attributes?.['next.segment']).not.toContain(paramValue)
+        expect(span.attributes?.['next.segment']).not.toContain(searchValue)
+      }
+      expect(
+        renderAttemptSpans?.some((span) => span.name?.includes('[slug]'))
+      ).toBe(true)
+      expect(
+        renderAttemptSpans?.some((span) => {
+          const segment = span.attributes?.['next.segment']
+          return typeof segment === 'string' && segment.includes('[slug]')
+        })
+      ).toBe(true)
     })
   })
 

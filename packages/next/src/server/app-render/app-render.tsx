@@ -100,11 +100,8 @@ import {
   getRequestInsightsIdentity,
   runWithRequestInsightsIdentity,
 } from '../lib/trace/request-insights-identity'
-import { getTracer, SpanStatusCode } from '../lib/trace/tracer'
-import {
-  createLocalSpan,
-  withLocalSpan,
-} from '../lib/trace/local-span-recorder'
+import { getTracer, SpanStatusCode, type Span } from '../lib/trace/tracer'
+import { createLocalSpan } from '../lib/trace/local-span-recorder'
 import { isRequestInsightsEnabled } from '../lib/trace/request-insights'
 import { FlightRenderResult } from './flight-render-result'
 import {
@@ -4481,7 +4478,7 @@ function runDevValidationInBackground(
         return
       }
 
-      return runInstantInsightsWithTracing(ctx, async () => {
+      return runInstantInsightsWithTracing(ctx, async (instantInsightsSpan) => {
         // Read whether the streamed render errored only now that it has fully
         // settled.
         const devRenderDidError = getDevRenderDidError()
@@ -4491,7 +4488,14 @@ function runDevValidationInBackground(
         // that (a no-op when the render didn't miss) before planning, which reads
         // the work store.
         if (result.hadCacheMiss) {
-          await cacheSignal.cacheReady()
+          await getTracer().trace(
+            AppRenderSpan.instantInsightsWaitForCache,
+            {
+              spanName: 'Wait for cache readiness',
+              parentSpan: instantInsightsSpan,
+            },
+            () => cacheSignal.cacheReady()
+          )
         }
 
         if (validationAbortSignal.aborted) {
@@ -4510,32 +4514,42 @@ function runDevValidationInBackground(
           return
         }
 
-        const lazyInputs = await prepareValidationInputs(
-          prefetchMode,
-          navigationKind,
-          result,
-          requestStore,
-          validationDebugChannel,
-          ctx,
-          prerenderResumeDataCache,
-          createRequestStore,
-          getPayload,
-          onError,
-          validationAbortSignal
-        )
+        const [instantInputs, staticInputs] = await getTracer().trace(
+          AppRenderSpan.instantInsightsPrepareValidation,
+          {
+            spanName: 'Prepare validation inputs',
+            parentSpan: instantInsightsSpan,
+          },
+          async () => {
+            const lazyInputs = await prepareValidationInputs(
+              prefetchMode,
+              navigationKind,
+              result,
+              requestStore,
+              validationDebugChannel,
+              ctx,
+              prerenderResumeDataCache,
+              createRequestStore,
+              getPayload,
+              onError,
+              validationAbortSignal
+            )
 
-        // If we need to do multiple renders, do them in parallel.
-        // `runValidationInDev` currently needs `instantInputs` eagerly
-        // right before using `staticInputs` for static shell validation,
-        // so there's no point delaying one of the renders.
-        // We bail out (after logging an error during `resolveLazyDevValidationInputs`)
-        // if sync IO or invalid dynamic errors happen in either.
-        const [instantInputs, staticInputs] = await Promise.all([
-          lazyInputs.instantInputs
-            ? resolveLazyDevValidationInputs(lazyInputs.instantInputs, ctx)
-            : null,
-          resolveLazyDevValidationInputs(lazyInputs.staticInputs, ctx),
-        ])
+            // If we need to do multiple renders, do them in parallel.
+            // `runValidationInDev` currently needs `instantInputs` eagerly
+            // right before using `staticInputs` for static shell validation,
+            // so there's no point delaying one of the renders.
+            // We bail out (after logging an error during
+            // `resolveLazyDevValidationInputs`) if sync IO or invalid dynamic
+            // errors happen in either.
+            return Promise.all([
+              lazyInputs.instantInputs
+                ? resolveLazyDevValidationInputs(lazyInputs.instantInputs, ctx)
+                : null,
+              resolveLazyDevValidationInputs(lazyInputs.staticInputs, ctx),
+            ])
+          }
+        )
         if (
           instantInputs === VALIDATION_BAILOUT ||
           staticInputs === VALIDATION_BAILOUT
@@ -4550,14 +4564,23 @@ function runDevValidationInBackground(
           return
         }
 
-        return runValidationInDev(
-          prefetchMode,
-          instantInputs,
-          staticInputs,
-          ctx,
-          fallbackRouteParams,
-          devRenderDidError,
-          validationAbortSignal
+        return getTracer().trace(
+          AppRenderSpan.instantInsightsRunValidation,
+          {
+            spanName: 'Run validation',
+            parentSpan: instantInsightsSpan,
+          },
+          (runValidationSpan) =>
+            runValidationInDev(
+              prefetchMode,
+              instantInputs,
+              staticInputs,
+              ctx,
+              fallbackRouteParams,
+              devRenderDidError,
+              validationAbortSignal,
+              runValidationSpan
+            )
         )
       })
     })
@@ -4580,7 +4603,7 @@ function runDevValidationInBackground(
 
 async function runInstantInsightsWithTracing<T>(
   ctx: AppRenderContext,
-  fn: () => Promise<T>
+  fn: (span?: Span) => Promise<T>
 ): Promise<T> {
   if (!isRequestInsightsEnabled()) {
     return fn()
@@ -4604,9 +4627,9 @@ async function runInstantInsightsWithTracing<T>(
         },
       })
 
-      return withLocalSpan(span, async () => {
+      return getTracer().withSpan(span, async () => {
         try {
-          return await fn()
+          return await fn(span)
         } catch (err) {
           span.recordException(err as Error)
           span.setStatus({ code: SpanStatusCode.ERROR })
@@ -6115,14 +6138,12 @@ async function runValidationInDevImpl(
   ctx: AppRenderContext,
   fallbackRouteParams: OpaqueFallbackRouteParams | null,
   devRenderDidError: boolean,
-  validationAbortSignal: AbortSignal
+  validationAbortSignal: AbortSignal,
+  runValidationSpan: Span | undefined
 ): Promise<void> {
   const { componentMod: ComponentMod, getDynamicParamFromSegment } = ctx
   const loaderTree = ComponentMod.routeModule.userland.loaderTree
   const rootParams = getRootParams(loaderTree, getDynamicParamFromSegment)
-
-  const needsInstantValidation =
-    await anySegmentNeedsInstantValidationInDev(loaderTree)
 
   // `samples` from instant config are only used during build
   const validationSamples = null
@@ -6131,30 +6152,42 @@ async function runValidationInDevImpl(
   //================================
   // Client module warmup
   //================================
-  {
-    // For warmup, we have to use the shared inputs if present -- the static inputs
-    // may not have a proper dynamic stage.
-    const { runtimeChunks, dynamicChunks } = (instantInputs ?? staticInputs)
-      .accumulatedChunks
+  const needsInstantValidation = await getTracer().trace(
+    AppRenderSpan.instantInsightsWarmupValidation,
+    {
+      spanName: 'Warm up validation',
+      parentSpan: runValidationSpan,
+    },
+    async () => {
+      const shouldRunInstantValidation =
+        await anySegmentNeedsInstantValidationInDev(loaderTree)
 
-    // First we warmup SSR with the runtime chunks. This ensures that when we do
-    // the full prerender pass with dynamic tracking module loading won't
-    // interrupt the prerender and can properly observe the entire content
-    await warmupClientModulesForStagedValidation(
-      // if we're going to be validating prefetches, we'll be rendering some segments in the dynamic stage.
-      // otherwise, for static shell validation, we only need to warm up to the runtime stage.
-      // we also need to use a different store type, because instant validation allows more APIs to resolve.
-      needsInstantValidation ? 'validation-client' : 'prerender-client',
-      needsInstantValidation ? dynamicChunks : runtimeChunks,
-      dynamicChunks,
-      rootParams,
-      fallbackRouteParams,
-      ctx,
-      validationSamples,
-      validationSampleTracking,
-      validationAbortSignal
-    )
-  }
+      // For warmup, we have to use the shared inputs if present -- the static inputs
+      // may not have a proper dynamic stage.
+      const { runtimeChunks, dynamicChunks } = (instantInputs ?? staticInputs)
+        .accumulatedChunks
+
+      // First we warmup SSR with the runtime chunks. This ensures that when we do
+      // the full prerender pass with dynamic tracking module loading won't
+      // interrupt the prerender and can properly observe the entire content
+      await warmupClientModulesForStagedValidation(
+        // if we're going to be validating prefetches, we'll be rendering some segments in the dynamic stage.
+        // otherwise, for static shell validation, we only need to warm up to the runtime stage.
+        // we also need to use a different store type, because instant validation allows more APIs to resolve.
+        shouldRunInstantValidation ? 'validation-client' : 'prerender-client',
+        shouldRunInstantValidation ? dynamicChunks : runtimeChunks,
+        dynamicChunks,
+        rootParams,
+        fallbackRouteParams,
+        ctx,
+        validationSamples,
+        validationSampleTracking,
+        validationAbortSignal
+      )
+
+      return shouldRunInstantValidation
+    }
+  )
 
   // React renders used by validation can occupy an entire event-loop turn.
   // Yield between them so a newer navigation can enter app rendering,
@@ -6188,21 +6221,30 @@ async function runValidationInDevImpl(
       return
     }
 
-    const inputs = staticInputs
+    const result = await getTracer().trace(
+      AppRenderSpan.instantInsightsValidateStaticShell,
+      {
+        spanName: 'Validate static shell',
+        parentSpan: runValidationSpan,
+      },
+      async () => {
+        const inputs = staticInputs
 
-    const debugChunks = inputs.debugChannelClient
-      ? await getDebugChunksOnce(inputs.debugChannelClient)
-      : null
-    const hmrRefreshHash = getHmrRefreshHash(inputs.requestStore)
+        const debugChunks = inputs.debugChannelClient
+          ? await getDebugChunksOnce(inputs.debugChannelClient)
+          : null
+        const hmrRefreshHash = getHmrRefreshHash(inputs.requestStore)
 
-    const result = await validateStaticShell(
-      inputs,
-      ctx,
-      rootParams,
-      fallbackRouteParams,
-      debugChunks,
-      hmrRefreshHash,
-      validationAbortSignal
+        return validateStaticShell(
+          inputs,
+          ctx,
+          rootParams,
+          fallbackRouteParams,
+          debugChunks,
+          hmrRefreshHash,
+          validationAbortSignal
+        )
+      }
     )
     // A newer render superseded this validation while its render ran, so its
     // result is stale. Don't surface errors for a page the user left.
@@ -6221,30 +6263,59 @@ async function runValidationInDevImpl(
   // Instant validation
   //================================
   if (needsInstantValidation && instantInputs) {
-    if (!(await yieldToForegroundRequest(validationAbortSignal))) {
-      return
+    const prepareRenderAttemptsSpan = runValidationSpan
+      ? getTracer().startSpan(
+          AppRenderSpan.instantInsightsPrepareRenderAttempts,
+          {
+            spanName: 'Prepare render attempts',
+            parentSpan: runValidationSpan,
+            attributes: {
+              'next.span_name': 'Prepare render attempts',
+              'next.span_type':
+                AppRenderSpan.instantInsightsPrepareRenderAttempts,
+            },
+          }
+        )
+      : undefined
+    let result: Array<unknown>
+    try {
+      if (!(await yieldToForegroundRequest(validationAbortSignal))) {
+        return
+      }
+
+      const inputs = instantInputs
+
+      const debugChunks = inputs.debugChannelClient
+        ? await getDebugChunksOnce(inputs.debugChannelClient)
+        : null
+      const hmrRefreshHash = getHmrRefreshHash(inputs.requestStore)
+
+      result = await validateInstantConfigs(
+        prefetchMode,
+        inputs.accumulatedChunks,
+        debugChunks,
+        inputs.startTime,
+        rootParams,
+        fallbackRouteParams,
+        ctx,
+        hmrRefreshHash,
+        validationSamples,
+        devRenderDidError,
+        validationAbortSignal,
+        runValidationSpan,
+        prepareRenderAttemptsSpan
+      )
+    } catch (err) {
+      if (prepareRenderAttemptsSpan?.isRecording()) {
+        prepareRenderAttemptsSpan.recordException(err as Error)
+        prepareRenderAttemptsSpan.setStatus({ code: SpanStatusCode.ERROR })
+      }
+      throw err
+    } finally {
+      if (prepareRenderAttemptsSpan?.isRecording()) {
+        prepareRenderAttemptsSpan.end()
+      }
     }
-
-    const inputs = instantInputs
-
-    const debugChunks = inputs.debugChannelClient
-      ? await getDebugChunksOnce(inputs.debugChannelClient)
-      : null
-    const hmrRefreshHash = getHmrRefreshHash(inputs.requestStore)
-
-    const result = await validateInstantConfigs(
-      prefetchMode,
-      inputs.accumulatedChunks,
-      debugChunks,
-      inputs.startTime,
-      rootParams,
-      fallbackRouteParams,
-      ctx,
-      hmrRefreshHash,
-      validationSamples,
-      devRenderDidError,
-      validationAbortSignal
-    )
 
     // A newer render superseded this work. Don't surface stale validation
     // errors for a page the user left.
@@ -6705,7 +6776,9 @@ async function validateInstantConfigs(
   hmrRefreshHash: string | undefined,
   validationSamples: ValidationStoreClient['validationSamples'] | null,
   devRenderDidError: boolean,
-  validationAbortSignal?: AbortSignal
+  validationAbortSignal?: AbortSignal,
+  renderAttemptParentSpan?: Span,
+  prepareRenderAttemptsSpan?: Span
 ): Promise<Array<unknown>> {
   const debug =
     process.env.NEXT_PRIVATE_DEBUG_VALIDATION === '1' ? console.log : undefined
@@ -6793,6 +6866,9 @@ async function validateInstantConfigs(
       for (const [id, filePath] of previousBoundaryState.requiredIds) {
         boundaryState.requiredIds.set(id, filePath)
       }
+      for (const [id, label] of previousBoundaryState.boundaryLabels) {
+        boundaryState.boundaryLabels.set(id, label)
+      }
     }
 
     const payloadResult = await createCombinedPayloadAtDepth(
@@ -6815,188 +6891,220 @@ async function validateInstantConfigs(
       return null
     }
 
-    const reactController = new AbortController()
-    const renderController = new AbortController()
-    const reactSignal =
-      validationAbortSignal === undefined
-        ? reactController.signal
-        : AbortSignal.any([reactController.signal, validationAbortSignal])
-    const preinitScripts = () => {}
-    const { ServerInsertedHTMLProvider } = createServerInsertedHTML()
-
-    const { stream: serverStream, debugStream } =
-      await createCombinedPayloadStream(
-        ctx.componentMod,
-        renderFlightStream,
-        payloadResult.payload,
-        extraChunksController,
-        reactSignal,
-        clientReferenceManifest,
-        startTime,
-        isDebugChannelEnabled,
-        createDebugChannel
-      )
-
-    const instantValidationState = createInstantValidationState(
-      payloadResult.slotStacks
+    const segmentPaths = Array.from(
+      boundaryState.requiredIds.keys(),
+      (segmentPath) => boundaryState.boundaryLabels.get(segmentPath) ?? '/'
     )
+    const segmentLabel = segmentPaths.length > 0 ? segmentPaths.join(', ') : '/'
+    const renderAttemptName = `Render ${segmentLabel}${
+      previousBoundaryState === null ? '' : ' (runtime retry)'
+    }`
 
-    const validationSampleTracking =
-      validationSamples !== null ? createValidationSampleTracking() : null
-
-    const clientDynamicTracking = createDynamicTrackingState(false)
-
-    const prerenderStore: PrerenderStore = {
-      type: 'validation-client',
-      phase: 'render',
-      rootParams,
-      implicitTags,
-      renderSignal: renderController.signal,
-      controller: reactController,
-      cacheSignal: null,
-      dynamicTracking: clientDynamicTracking,
-      revalidate: INFINITE_CACHE,
-      expire: INFINITE_CACHE,
-      stale: INFINITE_CACHE,
-      tags: [...implicitTags.tags],
-      resumeDataCache: null,
-      hmrRefreshHash,
-      varyParamsAccumulator: null,
-      boundaryState,
-      fallbackRouteParams,
-      validationSamples,
-      validationSampleTracking,
+    if (prepareRenderAttemptsSpan?.isRecording()) {
+      prepareRenderAttemptsSpan.end()
     }
 
-    let dynamicHoleKind: DynamicHoleKind
-    switch (prefetchKind) {
-      case ValidationPrefetchKind.Shell: {
-        dynamicHoleKind = payloadResult.hasAmbiguousErrors
-          ? DynamicHoleKind.Link
-          : DynamicHoleKind.Dynamic
-        break
-      }
-      case ValidationPrefetchKind.LegacySpeculative: {
-        dynamicHoleKind = payloadResult.hasAmbiguousErrors
-          ? DynamicHoleKind.Runtime
-          : DynamicHoleKind.Dynamic
-        break
-      }
-    }
+    const result = await getTracer().trace(
+      AppRenderSpan.instantInsightsRenderAttempt,
+      {
+        spanName: renderAttemptName,
+        parentSpan: renderAttemptParentSpan,
+        attributes: {
+          'next.segment': segmentLabel,
+        },
+      },
+      async () => {
+        const reactController = new AbortController()
+        const renderController = new AbortController()
+        const reactSignal =
+          validationAbortSignal === undefined
+            ? reactController.signal
+            : AbortSignal.any([reactController.signal, validationAbortSignal])
+        const preinitScripts = () => {}
+        const { ServerInsertedHTMLProvider } = createServerInsertedHTML()
 
-    let result: NavigationValidationResult
-    try {
-      const { prelude: unprocessedPrelude } = await runInSequentialTasks(
-        () => {
-          const pendingResult = workUnitAsyncStorage.run(
-            prerenderStore,
-            getClientPrerender,
-            // eslint-disable-next-line @next/internal/no-ambiguous-jsx -- React Client
-            <App
-              reactServerStream={serverStream}
-              reactDebugStream={debugStream ?? undefined}
-              debugEndTime={undefined}
-              preinitScripts={preinitScripts}
-              ServerInsertedHTMLProvider={ServerInsertedHTMLProvider}
-              nonce={nonce}
-              images={ctx.renderOpts.images}
-            />,
-            {
-              signal: reactSignal,
-              onError: (err: unknown, errorInfo: ErrorInfo) => {
-                if (isPrerenderInterruptedError(err) || reactSignal.aborted) {
-                  const componentStack = errorInfo.componentStack
-                  if (typeof componentStack === 'string') {
-                    trackDynamicHoleInNavigation(
-                      err,
-                      workStore,
-                      componentStack,
-                      instantValidationState,
-                      clientDynamicTracking,
-                      dynamicHoleKind,
-                      boundaryState
-                    )
-                  }
-                  return
-                } else if (!reactSignal.aborted) {
-                  const componentStack = errorInfo.componentStack
-                  if (typeof componentStack === 'string') {
-                    let errorForDisplay = err
-                    if (process.env.NODE_ENV === 'production') {
-                      // In production (i.e. build validation), Flight omits everything except the digest
-                      // when serializing errors, which makes them very unfriendly for debugging.
-                      // Map the deserialized errors back to their original error object to make it more useful.
-                      if (
-                        err &&
-                        typeof err === 'object' &&
-                        'digest' in err &&
-                        typeof err.digest === 'string'
-                      ) {
-                        const serverError =
-                          workStore.reactServerErrorsByDigest.get(err.digest)
-                        if (serverError !== undefined) {
-                          errorForDisplay = serverError
+        const { stream: serverStream, debugStream } =
+          await createCombinedPayloadStream(
+            ctx.componentMod,
+            renderFlightStream,
+            payloadResult.payload,
+            extraChunksController,
+            reactSignal,
+            clientReferenceManifest,
+            startTime,
+            isDebugChannelEnabled,
+            createDebugChannel
+          )
+
+        const instantValidationState = createInstantValidationState(
+          payloadResult.slotStacks
+        )
+
+        const validationSampleTracking =
+          validationSamples !== null ? createValidationSampleTracking() : null
+
+        const clientDynamicTracking = createDynamicTrackingState(false)
+
+        const prerenderStore: PrerenderStore = {
+          type: 'validation-client',
+          phase: 'render',
+          rootParams,
+          implicitTags,
+          renderSignal: renderController.signal,
+          controller: reactController,
+          cacheSignal: null,
+          dynamicTracking: clientDynamicTracking,
+          revalidate: INFINITE_CACHE,
+          expire: INFINITE_CACHE,
+          stale: INFINITE_CACHE,
+          tags: [...implicitTags.tags],
+          resumeDataCache: null,
+          hmrRefreshHash,
+          varyParamsAccumulator: null,
+          boundaryState,
+          fallbackRouteParams,
+          validationSamples,
+          validationSampleTracking,
+        }
+
+        let dynamicHoleKind: DynamicHoleKind
+        switch (prefetchKind) {
+          case ValidationPrefetchKind.Shell: {
+            dynamicHoleKind = payloadResult.hasAmbiguousErrors
+              ? DynamicHoleKind.Link
+              : DynamicHoleKind.Dynamic
+            break
+          }
+          case ValidationPrefetchKind.LegacySpeculative: {
+            dynamicHoleKind = payloadResult.hasAmbiguousErrors
+              ? DynamicHoleKind.Runtime
+              : DynamicHoleKind.Dynamic
+            break
+          }
+        }
+
+        let validationResult: NavigationValidationResult
+        try {
+          const { prelude: unprocessedPrelude } = await runInSequentialTasks(
+            () => {
+              const pendingResult = workUnitAsyncStorage.run(
+                prerenderStore,
+                getClientPrerender,
+                // eslint-disable-next-line @next/internal/no-ambiguous-jsx -- React Client
+                <App
+                  reactServerStream={serverStream}
+                  reactDebugStream={debugStream ?? undefined}
+                  debugEndTime={undefined}
+                  preinitScripts={preinitScripts}
+                  ServerInsertedHTMLProvider={ServerInsertedHTMLProvider}
+                  nonce={nonce}
+                  images={ctx.renderOpts.images}
+                />,
+                {
+                  signal: reactSignal,
+                  onError: (err: unknown, errorInfo: ErrorInfo) => {
+                    if (
+                      isPrerenderInterruptedError(err) ||
+                      reactSignal.aborted
+                    ) {
+                      const componentStack = errorInfo.componentStack
+                      if (typeof componentStack === 'string') {
+                        trackDynamicHoleInNavigation(
+                          err,
+                          workStore,
+                          componentStack,
+                          instantValidationState,
+                          clientDynamicTracking,
+                          dynamicHoleKind,
+                          boundaryState
+                        )
+                      }
+                      return
+                    } else if (!reactSignal.aborted) {
+                      const componentStack = errorInfo.componentStack
+                      if (typeof componentStack === 'string') {
+                        let errorForDisplay = err
+                        if (process.env.NODE_ENV === 'production') {
+                          // In production (i.e. build validation), Flight omits everything except the digest
+                          // when serializing errors, which makes them very unfriendly for debugging.
+                          // Map the deserialized errors back to their original error object to make it more useful.
+                          if (
+                            err &&
+                            typeof err === 'object' &&
+                            'digest' in err &&
+                            typeof err.digest === 'string'
+                          ) {
+                            const serverError =
+                              workStore.reactServerErrorsByDigest.get(
+                                err.digest
+                              )
+                            if (serverError !== undefined) {
+                              errorForDisplay = serverError
+                            }
+                          }
                         }
+
+                        trackThrownErrorInNavigation(
+                          workStore,
+                          instantValidationState,
+                          errorForDisplay,
+                          componentStack
+                        )
                       }
                     }
 
-                    trackThrownErrorInNavigation(
-                      workStore,
-                      instantValidationState,
-                      errorForDisplay,
-                      componentStack
-                    )
-                  }
-                }
+                    if (isReactLargeShellError(err)) {
+                      console.error(err)
+                      return undefined
+                    }
 
-                if (isReactLargeShellError(err)) {
-                  console.error(err)
-                  return undefined
+                    return getDigestForWellKnownError(err)
+                  },
                 }
+              )
 
-                return getDigestForWellKnownError(err)
-              },
+              reactSignal.addEventListener(
+                'abort',
+                () => {
+                  renderController.abort()
+                },
+                { once: true }
+              )
+
+              return pendingResult
+            },
+            () => {
+              workUnitAsyncStorage.run(
+                prerenderStore,
+                reactController.abort.bind(reactController)
+              )
             }
           )
 
-          reactSignal.addEventListener(
-            'abort',
-            () => {
-              renderController.abort()
-            },
-            { once: true }
-          )
+          const { preludeIsEmpty } = await processPreludeOp(unprocessedPrelude)
 
-          return pendingResult
-        },
-        () => {
-          workUnitAsyncStorage.run(
-            prerenderStore,
-            reactController.abort.bind(reactController)
+          validationResult = getNavigationDisallowedDynamicReasons(
+            workStore,
+            preludeIsEmpty ? PreludeState.Empty : PreludeState.Full,
+            instantValidationState,
+            validationSampleTracking,
+            boundaryState,
+            devRenderDidError
+          )
+        } catch (thrownValue) {
+          validationResult = getNavigationDisallowedDynamicReasons(
+            workStore,
+            PreludeState.Errored,
+            instantValidationState,
+            validationSampleTracking,
+            boundaryState,
+            devRenderDidError
           )
         }
-      )
 
-      const { preludeIsEmpty } = await processPreludeOp(unprocessedPrelude)
-
-      result = getNavigationDisallowedDynamicReasons(
-        workStore,
-        preludeIsEmpty ? PreludeState.Empty : PreludeState.Full,
-        instantValidationState,
-        validationSampleTracking,
-        boundaryState,
-        devRenderDidError
-      )
-    } catch (thrownValue) {
-      result = getNavigationDisallowedDynamicReasons(
-        workStore,
-        PreludeState.Errored,
-        instantValidationState,
-        validationSampleTracking,
-        boundaryState,
-        devRenderDidError
-      )
-    }
+        return validationResult
+      }
+    )
 
     // If the prerender produced no real errors at this depth — either an
     // empty array (clean) or a deferred-only result (Error/AggregateError

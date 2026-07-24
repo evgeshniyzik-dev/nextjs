@@ -90,6 +90,13 @@ enum AppRenderSpan {
   waitShellReady = 'AppRender.waitShellReady',
   renderToNodeFizzStream = 'AppRender.renderToNodeFizzStream',
   instantInsights = 'AppRender.instantInsights',
+  instantInsightsWaitForCache = 'AppRender.instantInsights.waitForCache',
+  instantInsightsPrepareValidation = 'AppRender.instantInsights.prepareValidation',
+  instantInsightsRunValidation = 'AppRender.instantInsights.runValidation',
+  instantInsightsWarmupValidation = 'AppRender.instantInsights.warmupValidation',
+  instantInsightsValidateStaticShell = 'AppRender.instantInsights.validateStaticShell',
+  instantInsightsPrepareRenderAttempts = 'AppRender.instantInsights.prepareRenderAttempts',
+  instantInsightsRenderAttempt = 'AppRender.instantInsights.renderAttempt',
 }
 
 enum RouterSpan {
